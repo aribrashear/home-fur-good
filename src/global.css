@@ -1,0 +1,11 @@
+* {
+  margin: 0px;
+  padding: 0px;
+  box-sizing: border-box;
+}
+
+/* Height of the leaflet container. */
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+}
