@@ -20,6 +20,13 @@ const ACTIONS = {
   REJECTED: "rejected",
 }
 
+const FETCH_REPEAT_MESSAGES = [
+  "Cleaning out dust...",
+  "Tightening loose screws...",
+  "Polishing surfaces...",
+  "Turning it off and on again...",
+]
+
 function reducer(state, action) {
   switch (action.type) {
     case ACTIONS.LOADING:
@@ -90,57 +97,94 @@ function AnimalsProvider({ children }) {
   // limit: int (default: 20, max: 100)
   // More: https://www.petfinder.com/developers/v2/docs/#get-animals
   async function getAnimals(options = {}) {
-    const cacheID = `animals:${options ? JSON.stringify(options) : "no-params"}`
     try {
       dispatch({ type: ACTIONS.LOADING, payload: "Finding Animals..." })
 
-      if (existsInCache(cacheID)) {
-        dispatch({
-          type: ACTIONS.ANIMALS_LOADED,
-          payload: cache.current[cacheID],
-        })
-      } else {
-        const {
-          data: { animals },
-        } = await client.animal.search({
-          ...options,
-        })
+      const {
+        data: { animals },
+      } = await client.animal.search({
+        ...options,
+      })
 
-        // STEP 01: FORMAT ANIMAL DATA FOR GEOCODING
-        dispatch({
-          type: ACTIONS.UPDATE_STATUS,
-          payload: "Processing animal data...",
-        })
-        // Returns formatted addresses, but also condenses the animals with matching locations to reduce unnecessary fetch calls.
-        const batchFormatAnimalArr = generateUniqueAddressArr(animals)
-        // Pulling only the relevant addresses to make the batch call.
-        const addressOnlyArr = batchFormatAnimalArr.map(
-          ({ address }) => address
-        )
-        // STEP 02: SEND BATCH GEOCODE REQUEST TO GET LAT/LNG
-        dispatch({
-          type: ACTIONS.UPDATE_STATUS,
-          payload: "Getting address data...",
-        })
+      // STEP 01: FORMAT ANIMAL DATA FOR GEOCODING
+      dispatch({
+        type: ACTIONS.UPDATE_STATUS,
+        payload: "Processing animal data...",
+      })
+      // Returns formatted addresses, but also condenses the animals with matching locations to reduce unnecessary fetch calls.
+      const batchFormatAnimalArr = generateUniqueAddressArr(animals)
+      // Pulling only the relevant addresses to make the batch call.
+      const addressOnlyArr = batchFormatAnimalArr.map(({ address }) => address)
+      // STEP 02: GET LAT/LNG INFORMATION TO DISPLAY ON MAP
+      dispatch({
+        type: ACTIONS.UPDATE_STATUS,
+        payload: "Getting address data...",
+      })
+
+      // Check to see if the location exists in storage, and remove it from the batch request if so.
+      let existingAddresses = []
+      let newAddresses = []
+      for (let i = 0; i < addressOnlyArr.length; i++) {
+        const curr = addressOnlyArr[i]
+        const storedAddress = localStorage.getItem(curr)
+        if (storedAddress) {
+          const parsed = JSON.parse(storedAddress)
+          existingAddresses.push(parsed)
+        } else {
+          newAddresses.push(curr)
+        }
+      }
+
+      // If there are new addresses that need to be requested, proceed with the batch function. Otherwise, we can go straight to the marker creation.
+      if (newAddresses.length > 0) {
         // Getting all lat/lng information as a batch request.
         const updatedAddressArr = await getBatchCoordinates(
-          addressOnlyArr,
-          5 * 1000,
-          12 // Will run for roughly a minute before maxing out.
+          newAddresses,
+          10 * 1000,
+          9 // Will run for roughly 1 1/2 minutes before maxing out.
         )
 
-        // STEP 03: Format data for use in displaying on the map.
-        dispatch({
-          type: ACTIONS.UPDATE_STATUS,
-          payload: "Finalizing results...",
-        })
-        const finalAnimalArr = createAnimalMarkers(
-          updatedAddressArr,
-          batchFormatAnimalArr
-        )
+        if (!updatedAddressArr)
+          dispatch({
+            type: ACTIONS.REJECTED,
+            payload: "Failed to get location data.",
+          })
 
-        dispatch({ type: ACTIONS.ANIMALS_LOADED, payload: finalAnimalArr })
+        const newFormattedAddresses = updatedAddressArr.map((address) => ({
+          id: address.place_id,
+          query: address.query.text,
+          lat: address.lat,
+          lng: address.lon,
+          state: address.state,
+          county: address.county,
+          city: address.city,
+          postcode: address.postcode,
+          attribution: address.datasource,
+        }))
+
+        // Adding all new addresses to the existing address array.
+        existingAddresses.push(...newFormattedAddresses)
+
+        // Caching the address data to localStorage to reduce bulk on API calls, since we expect it to remain the same over time.
+        for (let i = 0; i < newFormattedAddresses.length; i++) {
+          const curr = newFormattedAddresses[i]
+          const title = curr.query
+          const data = JSON.stringify(curr)
+          localStorage.setItem(title, data)
+        }
       }
+
+      // STEP 03: Format data for use in displaying on the map.
+      dispatch({
+        type: ACTIONS.UPDATE_STATUS,
+        payload: "Finalizing results...",
+      })
+      const finalAnimalArr = createAnimalMarkers(
+        existingAddresses,
+        batchFormatAnimalArr
+      )
+
+      dispatch({ type: ACTIONS.ANIMALS_LOADED, payload: finalAnimalArr })
     } catch (err) {
       console.error(err)
       dispatch({
@@ -172,6 +216,76 @@ function AnimalsProvider({ children }) {
         type: ACTIONS.REJECTED,
         payload: "There was an error fetching animal data.",
       })
+    }
+  }
+
+  // Gets geolocation information (specifically, lat/lng which is needed to display markers on the map) as a batch request from an array of address strings.
+  async function getBatchCoordinates(
+    arr,
+    timeout = 10 * 1000 /*timeout between attempts*/,
+    maxAttempts = 50
+  ) {
+    // This function expects an array of string addresses.
+    const baseURL = "https://api.geoapify.com/v1/batch/geocode/search?"
+    const params = {
+      lang: "en",
+      apiKey: import.meta.env.VITE_GEOCODING_API_KEY,
+    }
+    const query = new URLSearchParams(params).toString()
+
+    // Get the base URL for the batch request.
+    const res = await fetch(`${baseURL}${query}`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(arr),
+    })
+
+    if (res.ok) {
+      const { url } = await res.json()
+
+      const queryResult = await getAsyncResult(url, timeout, maxAttempts)
+
+      return queryResult
+    }
+
+    function getAsyncResult(url, timeout, maxAttempts) {
+      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          repeatUntilSuccess(url, resolve, reject, 0)
+        }, timeout)
+      })
+
+      async function repeatUntilSuccess(url, resolve, reject, attempt) {
+        try {
+          const res = await fetch(url)
+          if (res.status === 200) {
+            const data = await res.json()
+            resolve(data)
+          } else if (attempt >= maxAttempts) {
+            reject("Maximum amounts of attempts reached.")
+          } else if (res.status === 202) {
+            setTimeout(() => {
+              dispatch({
+                type: ACTIONS.UPDATE_STATUS,
+                payload:
+                  FETCH_REPEAT_MESSAGES[
+                    attempt < FETCH_REPEAT_MESSAGES.length
+                      ? attempt
+                      : attempt % FETCH_REPEAT_MESSAGES.length
+                  ],
+              })
+              repeatUntilSuccess(url, resolve, reject, attempt + 1)
+            }, timeout)
+          } else {
+            reject("Unknown error occurred.")
+          }
+        } catch (err) {
+          reject(err)
+        }
+      }
     }
   }
 
@@ -251,67 +365,6 @@ function generateUniqueAddressArr(animalData) {
   return addresses
 }
 
-// Gets geolocation information (specifically, lat/lng which is needed to display markers on the map) as a batch request from an array of address strings.
-async function getBatchCoordinates(
-  arr,
-  timeout = 10 * 1000 /*timeout between attempts*/,
-  maxAttempts = 50
-) {
-  // This function expects an array of string addresses.
-  const baseURL = "https://api.geoapify.com/v1/batch/geocode/search?"
-  const params = {
-    lang: "en",
-    apiKey: import.meta.env.VITE_GEOCODING_API_KEY,
-  }
-  const query = new URLSearchParams(params).toString()
-
-  // Get the base URL for the batch request.
-  const res = await fetch(`${baseURL}${query}`, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(arr),
-  })
-
-  if (res.ok) {
-    const { url } = await res.json()
-
-    const queryResult = await getAsyncResult(url, timeout, maxAttempts)
-
-    return queryResult
-  }
-
-  function getAsyncResult(url, timeout, maxAttempts) {
-    return new Promise((resolve, reject) => {
-      setTimeout(() => {
-        repeatUntilSuccess(url, resolve, reject, 0)
-      }, timeout)
-    })
-
-    async function repeatUntilSuccess(url, resolve, reject, attempt) {
-      try {
-        const res = await fetch(url)
-        if (res.status === 200) {
-          const data = await res.json()
-          resolve(data)
-        } else if (attempt >= maxAttempts) {
-          reject("Maximum amounts of attempts reached.")
-        } else if (res.status === 202) {
-          setTimeout(() => {
-            repeatUntilSuccess(url, resolve, reject, attempt + 1)
-          }, timeout)
-        } else {
-          reject("Unknown error occurred.")
-        }
-      } catch (err) {
-        reject(err)
-      }
-    }
-  }
-}
-
 // Accepts the geolocation and batched animal information in order to match up locations/animals with their respective lat/lng. Additionally, this will group any animals which may have had loose locations (EX. city, zipcode) that ended up with the same lat/lng to avoid duplicate pins on the map.
 function createAnimalMarkers(locations = [], batchedAnimArr = []) {
   let markers = []
@@ -336,11 +389,9 @@ function createAnimalMarkers(locations = [], batchedAnimArr = []) {
 
     // Gathering all location related data.
     // Match the original address query to the returned coordinates.
-    const relevantCoordinates = locations?.find(
-      (obj) => obj.query.text === address
-    )
-    const { lat, lon: lng } = relevantCoordinates
-    const id = `Marker${relevantCoordinates.place_id || animals[0].id}`
+    const relevantCoordinates = locations?.find((obj) => obj.query === address)
+    const { lat, lng } = relevantCoordinates
+    const id = `Marker${relevantCoordinates.id || animals[0].id}`
 
     // If no coordinates were provided, we cannot display them on the map.
     if (!lat || !lng) continue
